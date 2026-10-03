@@ -35,6 +35,7 @@
 #include "base/time/time.h"
 #include "base/trace_event/trace_event.h"
 #include "base/version.h"
+#include "base/win/pe_image.h"
 #include "base/win/registry.h"
 #include "base/win/scoped_handle.h"
 #include "base/win/shlwapi.h"
@@ -63,15 +64,19 @@ namespace {
 class DllPreReader : public base::PlatformThread::Delegate,
                      public base::SelfDeleting {
  public:
-  explicit DllPreReader(const base::FilePath& module,
-                        base::SelfDeletingPassKey key)
+  explicit DllPreReader(HMODULE module, base::SelfDeletingPassKey key)
       : SelfDeleting(key), module_(module) {}
 
   DllPreReader(const DllPreReader&) = delete;
   DllPreReader& operator=(const DllPreReader&) = delete;
 
   void ThreadMain() override {
-    base::PreReadFile(module_, /*is_executable=*/true, /*sequential=*/false);
+    const SIZE_T size =
+        base::win::PEImage(module_).GetNTHeaders()->OptionalHeader.SizeOfImage;
+    if (size != 0) {
+      ::WIN32_MEMORY_RANGE_ENTRY range = {module_, size};
+      ::PrefetchVirtualMemory(::GetCurrentProcess(), 1, &range, 0);
+    }
     // As a non-joinable thread delegate, this class must clean itself up when
     // finished.
     delete this;
@@ -80,7 +85,7 @@ class DllPreReader : public base::PlatformThread::Delegate,
  private:
   ~DllPreReader() override = default;
 
-  base::FilePath module_;
+  const HMODULE module_;
 };
 
 // The entry point signature of all main modules.
@@ -234,14 +239,17 @@ HMODULE LoadModuleWithDirectory(const base::FilePath& module,
     preread_begin_ticks = base::TimeTicks::Now();
     base::PreReadFile(module, /*is_executable=*/true, /*sequential=*/false);
     preread_end_ticks = base::TimeTicks::Now();
-  } else if (asynchronous_preread) {
-    base::PlatformThread::CreateNonJoinableWithType(
-        0, base::MakeSelfDeleting<DllPreReader>(module),
-        base::ThreadType::kDefault);
   }
 
   HMODULE handle = ::LoadLibraryExW(module.value().c_str(), nullptr,
                                     LOAD_WITH_ALTERED_SEARCH_PATH);
+  if (handle && asynchronous_preread) {
+    // Reuse the loaded image, which remains loaded until process exit.
+    // Background CPU/I/O priority reduces competition with initialization.
+    base::PlatformThread::CreateNonJoinableWithType(
+        0, base::MakeSelfDeleting<DllPreReader>(handle),
+        base::ThreadType::kBackground);
+  }
   return handle;
 }
 
